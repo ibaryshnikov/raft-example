@@ -50,6 +50,23 @@ pub struct Store {
 
 #[async_trait]
 impl RaftLogReader<TypeConfig> for Arc<Store> {
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+        let log = self.log.read().await;
+        let last = log.iter().next_back().map(|(_, entry)| entry.log_id);
+
+        let last_purged = *self.last_purged_log_id.read().await;
+
+        let last = match last {
+            None => last_purged,
+            Some(value) => Some(value),
+        };
+
+        Ok(LogState {
+            last_purged_log_id: last_purged,
+            last_log_id: last,
+        })
+    }
+
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
         &mut self,
         range: RB,
@@ -57,7 +74,7 @@ impl RaftLogReader<TypeConfig> for Arc<Store> {
         let log = self.log.read().await;
         let response = log
             .range(range.clone())
-            .map(|_, value| value.clone())
+            .map(|(_, value)| value.clone())
             .collect::<Vec<_>>();
         Ok(response)
     }
@@ -75,7 +92,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<Store> {
                 .map_err(|e| StorageIOError::read_state_machine(&e))?;
 
             last_applied_log = state_machine.last_applied_log;
-            last_membership = state_machine.last_membership;
+            last_membership = state_machine.last_membership.clone();
         }
 
         let snapshot_index = {
@@ -121,31 +138,18 @@ impl RaftStorage<TypeConfig> for Arc<Store> {
     type LogReader = Self;
     type SnapshotBuilder = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let log = self.log.read().await;
-        let last = log.iter().next_back().map(|(_, entry)| entry.log_id);
-
-        let last_purged = self.last_purged_log_id.read().await;
-
-        let last = match last {
-            None => last_purged,
-            Some(value) => Some(value),
-        };
-
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id: last,
-        })
-    }
-
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let locked = self.vote.lock().await;
+        let mut locked = self.vote.write().await;
         *locked = Some(*vote);
         Ok(())
     }
 
-    async fn read_vote(&mut self) -> Result<Vote<NodeId>, StorageError<NodeId>> {
-        Ok(self.vote.read().await)
+    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+        Ok(*self.vote.read().await)
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
     }
 
     async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
@@ -157,5 +161,137 @@ impl RaftStorage<TypeConfig> for Arc<Store> {
             log.insert(entry.log_id.index, entry);
         }
         Ok(())
+    }
+
+    async fn delete_conflict_logs_since(
+        &mut self,
+        log_id: LogId<NodeId>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let mut log = self.log.write().await;
+        let keys = log
+            .range(log_id.index..)
+            .map(|(k, _v)| *k)
+            .collect::<Vec<_>>();
+        for key in keys {
+            log.remove(&key);
+        }
+
+        Ok(())
+    }
+
+    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+        {
+            let mut log_id_lock = self.last_purged_log_id.write().await;
+            if let Some(last_purged_log_id) = *log_id_lock {
+                assert!(
+                    last_purged_log_id <= log_id,
+                    "Provided log_id must be less than the one already purged"
+                );
+            }
+            *log_id_lock = Some(log_id);
+        }
+
+        let mut log = self.log.write().await;
+        let keys = log
+            .range(..=log_id.index)
+            .map(|(k, _v)| *k)
+            .collect::<Vec<_>>();
+        for key in keys {
+            log.remove(&key);
+        }
+
+        Ok(())
+    }
+
+    async fn last_applied_state(
+        &mut self,
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
+    {
+        let state_machine = self.state_machine.read().await;
+        Ok((
+            state_machine.last_applied_log,
+            state_machine.last_membership.clone(),
+        ))
+    }
+
+    async fn apply_to_state_machine(
+        &mut self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<Vec<Response>, StorageError<NodeId>> {
+        let mut responses = Vec::with_capacity(entries.len());
+
+        let mut state_machine = self.state_machine.write().await;
+
+        for entry in entries {
+            state_machine.last_applied_log = Some(entry.log_id);
+            match entry.payload {
+                EntryPayload::Blank => responses.push(Response { value: None }),
+                EntryPayload::Normal(ref request) => match request {
+                    Request::Set { key, value } => {
+                        state_machine.data.insert(key.clone(), value.clone());
+                        responses.push(Response {
+                            value: Some(value.clone()),
+                        });
+                    }
+                },
+                EntryPayload::Membership(ref membership) => {
+                    state_machine.last_membership =
+                        StoredMembership::new(Some(entry.log_id.clone()), membership.clone());
+                    responses.push(Response { value: None })
+                }
+            }
+        }
+
+        Ok(responses)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<<TypeConfig as RaftTypeConfig>::SnapshotData>, StorageError<NodeId>> {
+        Ok(Box::new(Cursor::new(Vec::new())))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot: Box<<TypeConfig as RaftTypeConfig>::SnapshotData>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let new_snapshot = StoredSnapshot {
+            meta: meta.clone(),
+            data: snapshot.into_inner(),
+        };
+
+        {
+            let updated_state_machine: StateMachine = serde_json::from_slice(&new_snapshot.data)
+                .map_err(|e| {
+                    StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e)
+                })?;
+            let mut state_machine = self.state_machine.write().await;
+            *state_machine = updated_state_machine;
+        }
+
+        let mut current_snapshot = self.current_snapshot.write().await;
+        *current_snapshot = Some(new_snapshot);
+
+        Ok(())
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+        match &*self.current_snapshot.read().await {
+            Some(snapshot) => {
+                let data = snapshot.data.clone();
+                Ok(Some(Snapshot {
+                    meta: snapshot.meta.clone(),
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }
