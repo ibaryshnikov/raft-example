@@ -14,7 +14,6 @@ cargo run -- --id 1 --http-addr 127.0.0.1:8081
 
 Init leader
 ```bash
-#
 curl http://localhost:8081/init -H "Content-Type: application/json" -d '{}'
 ```
 
