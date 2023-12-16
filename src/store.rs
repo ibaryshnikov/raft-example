@@ -236,7 +236,7 @@ impl RaftStorage<TypeConfig> for Arc<Store> {
                 },
                 EntryPayload::Membership(ref membership) => {
                     state_machine.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), membership.clone());
+                        StoredMembership::new(Some(entry.log_id), membership.clone());
                     responses.push(Response { value: None })
                 }
             }

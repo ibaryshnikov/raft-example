@@ -1,16 +1,20 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use axum::{routing, Router};
+use clap::Parser;
 use openraft::storage::Adaptor;
-use openraft::{BasicNode, Config};
+use openraft::BasicNode;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
+mod app;
+mod client;
 mod network;
 mod node;
 mod store;
 mod types;
 
+use app::App;
 use network::Network;
 use store::{Request, Response, Store};
 
@@ -24,6 +28,17 @@ openraft::declare_raft_types!(
 pub type LogStore = Adaptor<TypeConfig, Arc<Store>>;
 pub type StateMachineStore = Adaptor<TypeConfig, Arc<Store>>;
 pub type Raft = openraft::Raft<TypeConfig, Network, LogStore, StateMachineStore>;
+pub type SharedState = Arc<Mutex<App>>;
+
+#[derive(Parser, Clone, Debug)]
+#[clap(author, version, about, long_about = None)]
+pub struct Options {
+    #[clap(long)]
+    pub id: u64,
+
+    #[clap(long)]
+    pub http_addr: String,
+}
 
 #[tokio::main]
 async fn main() {
@@ -35,16 +50,7 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let app = Router::new().route("/", routing::get(hello));
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
-        .await
-        .expect("Should create a listener");
-    axum::serve(listener, app)
-        .await
-        .expect("Error running a server");
-    // node::start().await;
-}
+    let options = Options::parse();
 
-async fn hello() -> &'static str {
-    "Hello from axum!"
+    node::start(options.id, options.http_addr).await;
 }
